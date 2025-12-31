@@ -75,9 +75,18 @@ def extract_features(signal, window_size=64):
         skewness = np.mean(((window - mean) / np.std(window))**3) if np.std(window) > 0 else 0
         kurtosis = np.mean(((window - mean) / np.std(window))**4) if np.std(window) > 0 else 0
 
-        fft = np.fft.fft(window)
+        # Remove DC component (gravity) for FFT analysis
+        window_centered = window - mean
+        fft = np.fft.fft(window_centered)
         freqs = np.fft.fftfreq(len(window), 1/SAMPLE_RATE)
-        dominant_freq = abs(freqs[np.argmax(np.abs(fft))])
+        
+        # Find peak frequency (ignoring 0Hz index since we centered it, but argmax might still pick small noise near 0)
+        # We look at the positive half of the spectrum
+        positive_freqs = freqs[:len(window)//2]
+        positive_fft = np.abs(fft[:len(window)//2])
+        
+        # Skip the first bin (0Hz) just in case
+        dominant_freq = abs(positive_freqs[np.argmax(positive_fft[1:]) + 1])
 
         harmonic_ratio = peak / mean if mean > 0 else 0
         energy = np.sum(window**2) / len(window)
