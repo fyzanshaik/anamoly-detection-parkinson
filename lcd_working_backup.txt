@@ -1,0 +1,34 @@
+#include <Wire.h> 
+#include <LiquidCrystal_I2C.h>
+
+// Set the LCD address to 0x27 for a 16 chars and 2 line display
+// Some common addresses are 0x27 and 0x3F
+// You might need to change this if your screen has a different address
+#define I2C_ADDR    0x27
+#define LCD_COLUMNS 16
+#define LCD_ROWS    2
+
+// Initialize the LCD object
+LiquidCrystal_I2C lcd(I2C_ADDR, LCD_COLUMNS, LCD_ROWS);
+
+void setup() {
+  // Start the I2C communication
+  Wire.begin(); 
+  
+  // Initialize the LCD
+  lcd.init();      
+  
+  // Turn on the backlight
+  lcd.backlight(); 
+
+  // Print a message to the LCD
+  lcd.setCursor(0, 0); // Set cursor to the first column (0) and first row (0)
+  lcd.print("Hello, World!");
+  
+  lcd.setCursor(0, 1); // Set cursor to the first column (0) and second row (1)
+  lcd.print("ESP32 LCD Demo");
+}
+
+void loop() {
+  // The loop is empty because we only need to display the text once
+}

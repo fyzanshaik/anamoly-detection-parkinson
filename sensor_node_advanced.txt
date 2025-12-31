@@ -1,0 +1,580 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <esp_now.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <Wire.h>
+#include <Adafruit_SSD1306.h>
+
+// ============ CONFIGURATION ============
+#define NODE_ID 1
+#define HAS_OLED true  // Set to false for Node 2
+
+// Hardware Pins
+#define MOTOR_IN1 18
+#define MOTOR_IN2 19
+#define GREEN_LED 23
+#define RED_LED 15   // Changed from 5 to 15 (GPIO5 conflicts with OLED SCL)
+
+// MPU6050 I2C (Primary)
+#define MPU_SDA 22
+#define MPU_SCL 21
+
+// OLED I2C (Secondary - only for Node 1)
+#define OLED_SDA 2   // D4
+#define OLED_SCL 5   // D5
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+
+// ML Configuration
+#define VIBRATION_THRESHOLD 60.0
+#define INPUT_DIM 8
+#define HIDDEN_DIM 4
+#define RECONSTRUCTION_THRESHOLD 0.35
+#define BUFFER_SIZE 20
+#define HEARTBEAT_INTERVAL 5000  // 5 seconds
+
+uint8_t gatewayMAC[] = {0xC0, 0xCD, 0xD6, 0xCD, 0xF1, 0xBC};
+
+// ============ DATA STRUCTURES ============
+typedef struct {
+  uint8_t nodeId;
+  bool isAnomalous;
+  float vibrationLevel;
+} SensorMessage;
+
+// Message buffer for when gateway is offline
+struct MessageBuffer {
+  SensorMessage messages[BUFFER_SIZE];
+  int writeIndex;
+  int readIndex;
+  int count;
+} msgBuffer = {.writeIndex = 0, .readIndex = 0, .count = 0};
+
+// Edge ML Model (simplified autoencoder)
+struct EdgeAutoencoder {
+  float encoder_weights[INPUT_DIM][HIDDEN_DIM];
+  float decoder_weights[HIDDEN_DIM][INPUT_DIM];
+  float encoder_bias[HIDDEN_DIM];
+  float decoder_bias[INPUT_DIM];
+} edgeModel;
+
+struct SensorState {
+  float vibrationHistory[64];
+  int historyIndex;
+  float features[INPUT_DIM];
+  float reconstructionError;
+  bool mpuConnected;
+  bool gatewayConnected;
+  unsigned long lastSuccessfulSend;
+  unsigned long lastHeartbeat;
+  int failedSendCount;
+  int motorSpeed;
+} sensorState;
+
+// ============ HARDWARE OBJECTS ============
+Adafruit_MPU6050 mpu;
+TwoWire I2C_OLED = TwoWire(1);  // Secondary I2C bus for OLED
+#if HAS_OLED
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &I2C_OLED, OLED_RESET);
+#endif
+
+// ============ FUNCTIONS ============
+
+void initializeEdgeModel() {
+  randomSeed(analogRead(0) + NODE_ID * 100);
+
+  Serial.println("[ML] Initializing edge autoencoder...");
+
+  for(int i = 0; i < INPUT_DIM; i++) {
+    for(int j = 0; j < HIDDEN_DIM; j++) {
+      edgeModel.encoder_weights[i][j] = random(-100, 100) / 100.0;
+    }
+    edgeModel.decoder_bias[i] = 0.1;
+  }
+
+  for(int i = 0; i < HIDDEN_DIM; i++) {
+    edgeModel.encoder_bias[i] = 0.1;
+    for(int j = 0; j < INPUT_DIM; j++) {
+      edgeModel.decoder_weights[i][j] = random(-100, 100) / 100.0;
+    }
+  }
+
+  Serial.println("[ML] Model initialized: 8-4-8 architecture");
+}
+
+void extractFeatures(float vibrationLevel) {
+  // Add to history
+  sensorState.vibrationHistory[sensorState.historyIndex] = vibrationLevel;
+  sensorState.historyIndex = (sensorState.historyIndex + 1) % 64;
+
+  // Compute features
+  float mean = 0, peak = 0, sum_sq = 0;
+  for(int i = 0; i < 64; i++) {
+    mean += sensorState.vibrationHistory[i];
+    if(sensorState.vibrationHistory[i] > peak) peak = sensorState.vibrationHistory[i];
+    sum_sq += sensorState.vibrationHistory[i] * sensorState.vibrationHistory[i];
+  }
+  mean /= 64.0;
+  float rms = sqrt(sum_sq / 64.0);
+
+  // Feature vector
+  sensorState.features[0] = mean;
+  sensorState.features[1] = peak;
+  sensorState.features[2] = rms;
+  sensorState.features[3] = (vibrationLevel - mean) / 10.0; // Skewness approx
+  sensorState.features[4] = vibrationLevel / (mean + 0.01); // Kurtosis approx
+  sensorState.features[5] = (NODE_ID == 1) ? 120.0 : 35.0;  // Dominant freq
+  sensorState.features[6] = peak / (mean + 0.01);            // Harmonic ratio
+  sensorState.features[7] = sum_sq / 64.0;                   // Energy
+}
+
+float runEdgeInference() {
+  // Encoder forward pass
+  float hidden[HIDDEN_DIM] = {0};
+  for(int j = 0; j < HIDDEN_DIM; j++) {
+    for(int i = 0; i < INPUT_DIM; i++) {
+      hidden[j] += sensorState.features[i] * edgeModel.encoder_weights[i][j];
+    }
+    hidden[j] += edgeModel.encoder_bias[j];
+    if(hidden[j] < 0) hidden[j] = 0;  // ReLU
+  }
+
+  // Decoder forward pass
+  float reconstructed[INPUT_DIM] = {0};
+  for(int i = 0; i < INPUT_DIM; i++) {
+    for(int j = 0; j < HIDDEN_DIM; j++) {
+      reconstructed[i] += hidden[j] * edgeModel.decoder_weights[j][i];
+    }
+    reconstructed[i] += edgeModel.decoder_bias[i];
+  }
+
+  // Compute MSE
+  float error = 0;
+  for(int i = 0; i < INPUT_DIM; i++) {
+    float diff = sensorState.features[i] - reconstructed[i];
+    error += diff * diff;
+  }
+  error /= INPUT_DIM;
+
+  sensorState.reconstructionError = error;
+  return error;
+}
+
+void bufferMessage(SensorMessage msg) {
+  if(msgBuffer.count < BUFFER_SIZE) {
+    msgBuffer.messages[msgBuffer.writeIndex] = msg;
+    msgBuffer.writeIndex = (msgBuffer.writeIndex + 1) % BUFFER_SIZE;
+    msgBuffer.count++;
+    Serial.print("[BUFFER] Stored message (");
+    Serial.print(msgBuffer.count);
+    Serial.println(" in queue)");
+  } else {
+    Serial.println("[BUFFER] Full! Dropping oldest message");
+    msgBuffer.readIndex = (msgBuffer.readIndex + 1) % BUFFER_SIZE;
+    msgBuffer.messages[msgBuffer.writeIndex] = msg;
+    msgBuffer.writeIndex = (msgBuffer.writeIndex + 1) % BUFFER_SIZE;
+  }
+}
+
+bool sendBufferedMessages() {
+  if(msgBuffer.count == 0) return true;
+
+  Serial.print("[BUFFER] Attempting to send ");
+  Serial.print(msgBuffer.count);
+  Serial.println(" buffered messages...");
+
+  int sent = 0;
+  while(msgBuffer.count > 0 && sent < 3) {  // Send max 3 per cycle
+    SensorMessage msg = msgBuffer.messages[msgBuffer.readIndex];
+    esp_err_t result = esp_now_send(gatewayMAC, (uint8_t*)&msg, sizeof(msg));
+
+    if(result == ESP_OK) {
+      msgBuffer.readIndex = (msgBuffer.readIndex + 1) % BUFFER_SIZE;
+      msgBuffer.count--;
+      sent++;
+      delay(50);  // Small delay between sends
+    } else {
+      Serial.println("[BUFFER] Send failed, will retry later");
+      return false;
+    }
+  }
+
+  Serial.print("[BUFFER] Sent ");
+  Serial.print(sent);
+  Serial.print(" messages, ");
+  Serial.print(msgBuffer.count);
+  Serial.println(" remaining");
+
+  return true;
+}
+
+void updateOLED(float vibration, bool anomaly, bool gatewayOk) {
+#if HAS_OLED
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  // Header
+  display.setCursor(0, 0);
+  display.print("Node ");
+  display.print(NODE_ID);
+  display.print(" | ");
+  display.print(gatewayOk ? "GW:OK" : "GW:LOST");
+
+  // Vibration
+  display.setCursor(0, 12);
+  display.print("Vib: ");
+  display.print(vibration, 2);
+  display.print(" m/s2");
+
+  // Reconstruction Error
+  display.setCursor(0, 24);
+  display.print("Err: ");
+  display.print(sensorState.reconstructionError, 4);
+
+  // Status
+  display.setCursor(0, 36);
+  if(anomaly) {
+    display.print("STATUS: ANOMALY!");
+  } else {
+    display.print("STATUS: Normal");
+  }
+
+  // Motor Speed
+  display.setCursor(0, 48);
+  display.print("Motor: ");
+  display.print(sensorState.motorSpeed);
+  display.print("%");
+
+  // Buffer status
+  if(msgBuffer.count > 0) {
+    display.setCursor(0, 56);
+    display.print("Buffer: ");
+    display.print(msgBuffer.count);
+    display.print("/");
+    display.print(BUFFER_SIZE);
+  }
+
+  display.display();
+#endif
+}
+
+void onDataSent(const uint8_t *mac, esp_now_send_status_t status) {
+  if(status == ESP_NOW_SEND_SUCCESS) {
+    sensorState.gatewayConnected = true;
+    sensorState.lastSuccessfulSend = millis();
+    sensorState.failedSendCount = 0;
+    Serial.println("[ESP-NOW] ✓ Send Success");
+
+    // Try to send buffered messages if any
+    if(msgBuffer.count > 0) {
+      sendBufferedMessages();
+    }
+  } else {
+    sensorState.failedSendCount++;
+    Serial.print("[ESP-NOW] ✗ Send Failed (");
+    Serial.print(sensorState.failedSendCount);
+    Serial.println(" consecutive)");
+
+    if(sensorState.failedSendCount >= 3) {
+      sensorState.gatewayConnected = false;
+      Serial.println("[ESP-NOW] Gateway appears offline");
+    }
+  }
+}
+
+void adjustMotorSpeed() {
+  // Vary motor speed for different vibration patterns
+  static unsigned long lastSpeedChange = 0;
+
+  if(millis() - lastSpeedChange > 10000) {  // Change every 10 seconds
+    int speeds[] = {180, 200, 220, 255};
+    static int speedIndex = 0;
+
+    speedIndex = (speedIndex + 1) % 4;
+    sensorState.motorSpeed = (speeds[speedIndex] * 100) / 255;
+
+    analogWrite(MOTOR_IN1, speeds[speedIndex]);
+    digitalWrite(MOTOR_IN2, LOW);
+
+    Serial.print("[MOTOR] Speed changed to ");
+    Serial.print(sensorState.motorSpeed);
+    Serial.println("%");
+
+    lastSpeedChange = millis();
+  }
+}
+
+void sendHeartbeat() {
+  if(millis() - sensorState.lastHeartbeat > HEARTBEAT_INTERVAL) {
+    Serial.println("[HEARTBEAT] Ping gateway");
+    sensorState.lastHeartbeat = millis();
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(2000);
+
+  Serial.println("\n\n=================================");
+  Serial.println("   SENSOR NODE " + String(NODE_ID));
+  Serial.println("   Edge AI Vibration Monitor");
+  Serial.println("=================================\n");
+
+  // Initialize state
+  sensorState.historyIndex = 0;
+  sensorState.reconstructionError = 0;
+  sensorState.mpuConnected = false;
+  sensorState.gatewayConnected = false;
+  sensorState.lastSuccessfulSend = 0;
+  sensorState.lastHeartbeat = 0;
+  sensorState.failedSendCount = 0;
+  sensorState.motorSpeed = 70;
+
+  for(int i = 0; i < 64; i++) {
+    sensorState.vibrationHistory[i] = 0;
+  }
+
+  // Initialize ML Model
+  initializeEdgeModel();
+
+  // GPIO Setup
+  pinMode(MOTOR_IN1, OUTPUT);
+  pinMode(MOTOR_IN2, OUTPUT);
+  pinMode(GREEN_LED, OUTPUT);
+  pinMode(RED_LED, OUTPUT);
+
+  digitalWrite(MOTOR_IN1, LOW);
+  digitalWrite(MOTOR_IN2, LOW);
+  digitalWrite(GREEN_LED, LOW);
+  digitalWrite(RED_LED, LOW);
+
+  Serial.println("[GPIO] Pins configured");
+
+  // Initialize OLED
+#if HAS_OLED
+  I2C_OLED.begin(OLED_SDA, OLED_SCL, 100000);
+
+  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("[OLED] ✗ SSD1306 allocation failed");
+  } else {
+    Serial.println("[OLED] ✓ Display initialized");
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 0);
+    display.println("Node " + String(NODE_ID));
+    display.println("Initializing...");
+    display.display();
+    delay(1000);
+  }
+#endif
+
+  // Initialize WiFi & ESP-NOW
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  delay(100);
+
+  Serial.print("[WIFI] MAC Address: ");
+  Serial.println(WiFi.macAddress());
+
+  if(esp_now_init() != ESP_OK) {
+    Serial.println("[ESP-NOW] ✗ Initialization failed!");
+    digitalWrite(RED_LED, HIGH);
+    while(1) {
+#if HAS_OLED
+      display.clearDisplay();
+      display.setCursor(0, 20);
+      display.println("ESP-NOW FAILED");
+      display.display();
+#endif
+      delay(1000);
+    }
+  }
+
+  Serial.println("[ESP-NOW] ✓ Initialized");
+  esp_now_register_send_cb(onDataSent);
+
+  // Add gateway peer
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, gatewayMAC, 6);
+  peerInfo.channel = 0;
+  peerInfo.encrypt = false;
+  peerInfo.ifidx = WIFI_IF_STA;
+
+  if(esp_now_add_peer(&peerInfo) != ESP_OK) {
+    Serial.println("[ESP-NOW] ✗ Failed to add gateway peer");
+    while(1);
+  }
+
+  Serial.print("[ESP-NOW] ✓ Gateway peer added: ");
+  Serial.printf("%02X:%02X:%02X:%02X:%02X:%02X\n",
+    gatewayMAC[0], gatewayMAC[1], gatewayMAC[2],
+    gatewayMAC[3], gatewayMAC[4], gatewayMAC[5]);
+
+  // Initialize MPU6050
+  Wire.begin(MPU_SDA, MPU_SCL);
+
+  Serial.println("[MPU6050] Searching for sensor...");
+
+  if(!mpu.begin()) {
+    Serial.println("[MPU6050] ✗ Not found!");
+    digitalWrite(RED_LED, HIGH);
+    while(1) {
+#if HAS_OLED
+      display.clearDisplay();
+      display.setCursor(0, 20);
+      display.println("MPU6050 NOT FOUND");
+      display.display();
+#endif
+      delay(1000);
+    }
+  }
+
+  Serial.println("[MPU6050] ✓ Found and configured");
+  mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+  sensorState.mpuConnected = true;
+
+  // Start motor at 70% speed
+  analogWrite(MOTOR_IN1, 180);
+  digitalWrite(MOTOR_IN2, LOW);
+  digitalWrite(GREEN_LED, HIGH);
+
+  Serial.println("[MOTOR] ✓ Started at 70%");
+  Serial.println("\n=================================");
+  Serial.println("   SYSTEM READY - MONITORING");
+  Serial.println("=================================\n");
+
+#if HAS_OLED
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.println("SYSTEM READY");
+  display.setCursor(0, 20);
+  display.println("Monitoring...");
+  display.display();
+  delay(1500);
+#endif
+}
+
+void loop() {
+  // Check MPU6050 connection
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+
+  bool is_all_zero = (a.acceleration.x == 0.00 && a.acceleration.y == 0.00 &&
+                      a.acceleration.z == 0.00 && g.gyro.x == 0.00 &&
+                      g.gyro.y == 0.00 && g.gyro.z == 0.00);
+
+  if(is_all_zero && sensorState.mpuConnected) {
+    sensorState.mpuConnected = false;
+    Serial.println("[MPU6050] ✗ Connection lost! Stopping motor...");
+    digitalWrite(MOTOR_IN1, LOW);
+    digitalWrite(MOTOR_IN2, LOW);
+    digitalWrite(GREEN_LED, LOW);
+    digitalWrite(RED_LED, HIGH);
+
+#if HAS_OLED
+    updateOLED(0, false, sensorState.gatewayConnected);
+#endif
+
+    // Try to reconnect
+    Serial.println("[MPU6050] Attempting reconnection...");
+    delay(500);
+
+    if(mpu.begin()) {
+      Serial.println("[MPU6050] ✓ Reconnected!");
+      mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+      mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+      mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+      sensorState.mpuConnected = true;
+
+      analogWrite(MOTOR_IN1, 180);
+      digitalWrite(MOTOR_IN2, LOW);
+      digitalWrite(GREEN_LED, HIGH);
+      digitalWrite(RED_LED, LOW);
+    }
+
+    return;
+  }
+
+  if(!sensorState.mpuConnected) {
+    delay(500);
+    return;
+  }
+
+  // Calculate vibration magnitude
+  float vibration_magnitude = sqrt(
+    a.acceleration.x * a.acceleration.x +
+    a.acceleration.y * a.acceleration.y +
+    a.acceleration.z * a.acceleration.z
+  );
+
+  // Extract features
+  extractFeatures(vibration_magnitude);
+
+  // Run edge ML inference
+  float reconError = runEdgeInference();
+
+  // Determine anomaly
+  bool isAnomalous = (reconError > RECONSTRUCTION_THRESHOLD) ||
+                     (vibration_magnitude > VIBRATION_THRESHOLD);
+
+  // Prepare message
+  SensorMessage msg;
+  msg.nodeId = NODE_ID;
+  msg.isAnomalous = isAnomalous;
+  msg.vibrationLevel = vibration_magnitude;
+
+  // Try to send to gateway
+  esp_err_t result = esp_now_send(gatewayMAC, (uint8_t*)&msg, sizeof(msg));
+
+  if(result != ESP_OK) {
+    Serial.println("[ESP-NOW] Send error, buffering message...");
+    bufferMessage(msg);
+  }
+
+  // Serial output for debugging
+  Serial.print("[DATA] Vib: ");
+  Serial.print(vibration_magnitude, 2);
+  Serial.print(" | Err: ");
+  Serial.print(reconError, 4);
+  Serial.print(" | Status: ");
+  Serial.print(isAnomalous ? "ANOMALY" : "Normal");
+  Serial.print(" | Gateway: ");
+  Serial.print(sensorState.gatewayConnected ? "Connected" : "Disconnected");
+  Serial.print(" | Buffer: ");
+  Serial.println(msgBuffer.count);
+
+  // Update LEDs
+  if(isAnomalous) {
+    digitalWrite(GREEN_LED, LOW);
+    digitalWrite(RED_LED, HIGH);
+  } else {
+    digitalWrite(GREEN_LED, HIGH);
+    digitalWrite(RED_LED, LOW);
+  }
+
+  // Update OLED
+#if HAS_OLED
+  updateOLED(vibration_magnitude, isAnomalous, sensorState.gatewayConnected);
+#endif
+
+  // Adjust motor speed periodically
+  adjustMotorSpeed();
+
+  // Send heartbeat
+  sendHeartbeat();
+
+  // Check gateway timeout
+  if(sensorState.gatewayConnected &&
+     (millis() - sensorState.lastSuccessfulSend > 15000)) {
+    Serial.println("[ESP-NOW] Gateway timeout detected");
+    sensorState.gatewayConnected = false;
+  }
+
+  delay(2000);
+}

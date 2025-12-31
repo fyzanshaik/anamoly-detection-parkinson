@@ -1,0 +1,187 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <esp_now.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <ESPAsyncWebServer.h>
+
+#define I2C_ADDR    0x27
+#define LCD_COLUMNS 16
+#define LCD_ROWS    2
+
+const char* ssid = "Gateway_Demo";
+const char* password = "12345678";
+
+LiquidCrystal_I2C lcd(I2C_ADDR, LCD_COLUMNS, LCD_ROWS);
+AsyncWebServer server(80);
+
+typedef struct {
+  uint8_t nodeId;
+  bool isAnomalous;
+  float vibrationLevel;
+} SensorMessage;
+
+SensorMessage incomingData;
+bool manualTrigger[3] = {false, false, false};
+
+const char html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+body{font-family:Arial;text-align:center;background:#1a1a2e;color:#eee;padding:20px}
+h1{color:#0f3460}
+.container{max-width:400px;margin:auto;background:#16213e;padding:30px;border-radius:15px;box-shadow:0 4px 6px rgba(0,0,0,0.3)}
+.btn{display:block;width:100%;padding:20px;margin:15px 0;font-size:18px;border:none;border-radius:8px;cursor:pointer;transition:0.3s}
+.normal{background:#27ae60;color:#fff}
+.normal:active{background:#229954}
+.alert{background:#e74c3c;color:#fff}
+.alert:active{background:#c0392b}
+.reset{background:#3498db;color:#fff}
+.reset:active{background:#2980b9}
+h3{color:#00d4ff;margin-top:25px}
+.status{background:#0f3460;padding:10px;border-radius:5px;margin:10px 0}
+</style>
+</head>
+<body>
+<div class="container">
+<h1>🔧 Gateway Control</h1>
+<h3>Motor 1</h3>
+<button class="btn alert" onclick="trigger(1)">Trigger Anomaly</button>
+<h3>Motor 2</h3>
+<button class="btn alert" onclick="trigger(2)">Trigger Anomaly</button>
+<div class="status">
+<p>Connect to WiFi: <b>Gateway_Demo</b></p>
+<p>Password: <b>12345678</b></p>
+</div>
+<button class="btn reset" onclick="reset()">Reset All</button>
+</div>
+<script>
+function trigger(node){
+fetch('/trigger?node='+node);
+alert('Triggered Node '+node);
+}
+function reset(){
+fetch('/reset');
+alert('System Reset');
+}
+</script>
+</body>
+</html>
+)rawliteral";
+
+String getXAIExplanation(int nodeId, float vib) {
+  if(nodeId == 1) {
+    return "High-freq vib\nBearing wear";
+  } else if(nodeId == 2) {
+    return "Imbalance\nCheck rotor";
+  }
+  return "Unknown fault";
+}
+
+void onDataReceive(const uint8_t *mac, const uint8_t *data, int len) {
+  memcpy(&incomingData, data, sizeof(incomingData));
+
+  int nodeId = incomingData.nodeId;
+  bool isAnom = incomingData.isAnomalous || manualTrigger[nodeId - 1];
+
+  Serial.print("Node ");
+  Serial.print(nodeId);
+  Serial.print(": ");
+  Serial.println(isAnom ? "ANOMALY" : "NORMAL");
+
+  lcd.clear();
+
+  if(isAnom) {
+    lcd.setCursor(0, 0);
+    lcd.print("ALERT: Motor ");
+    lcd.print(nodeId);
+
+    lcd.setCursor(0, 1);
+    String explanation = getXAIExplanation(nodeId, incomingData.vibrationLevel);
+    lcd.print(explanation);
+  } else {
+    lcd.setCursor(0, 0);
+    lcd.print("Motor ");
+    lcd.print(nodeId);
+    lcd.print(": OK");
+
+    lcd.setCursor(0, 1);
+    lcd.print("Vib: ");
+    lcd.print(incomingData.vibrationLevel, 1);
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  Wire.begin(21, 22);
+  lcd.init();
+  lcd.backlight();
+
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAP(ssid, password);
+
+  Serial.println("=== Gateway Started ===");
+  Serial.print("AP IP: ");
+  Serial.println(WiFi.softAPIP());
+  Serial.print("MAC: ");
+  Serial.println(WiFi.macAddress());
+
+  if(esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW init failed");
+    lcd.print("ESP-NOW FAIL");
+    while(1);
+  }
+
+  esp_now_register_recv_cb(onDataReceive);
+
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+    request->send_P(200, "text/html", html);
+  });
+
+  server.on("/trigger", HTTP_GET, [](AsyncWebServerRequest *request){
+    if(request->hasParam("node")) {
+      int node = request->getParam("node")->value().toInt();
+      if(node >= 1 && node <= 2) {
+        manualTrigger[node - 1] = true;
+        Serial.println("Manual trigger: Node " + String(node));
+
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("ALERT: Motor ");
+        lcd.print(node);
+        lcd.setCursor(0, 1);
+        lcd.print(getXAIExplanation(node, 0));
+      }
+    }
+    request->send(200, "text/plain", "OK");
+  });
+
+  server.on("/reset", HTTP_GET, [](AsyncWebServerRequest *request){
+    manualTrigger[0] = false;
+    manualTrigger[1] = false;
+    Serial.println("System reset");
+    lcd.clear();
+    lcd.print("System Reset");
+    request->send(200, "text/plain", "OK");
+  });
+
+  server.begin();
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Gateway Ready");
+  lcd.setCursor(0, 1);
+  lcd.print(WiFi.softAPIP());
+
+  Serial.println("Web server started");
+  Serial.println("Connect phone to: Gateway_Demo");
+  Serial.println("Password: 12345678");
+  Serial.println("Open: http://192.168.4.1");
+}
+
+void loop() {
+}

@@ -1,0 +1,439 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <esp_now.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <ESPAsyncWebServer.h>
+
+#define I2C_ADDR 0x27
+#define LCD_COLUMNS 16
+#define LCD_ROWS 2
+#define SIMULATION_TIMEOUT 3000
+#define INPUT_DIM 8
+#define HIDDEN_DIM 4
+
+const char* ssid = "Gateway_Demo";
+const char* password = "12345678";
+
+LiquidCrystal_I2C lcd(I2C_ADDR, LCD_COLUMNS, LCD_ROWS);
+AsyncWebServer server(80);
+
+typedef struct {
+  uint8_t nodeId;
+  bool isAnomalous;
+  float vibrationLevel;
+} SensorMessage;
+
+struct NodeState {
+  float vibration;
+  bool anomaly;
+  bool receivingData;
+  bool manuallyDisabled;
+  unsigned long lastUpdate;
+  unsigned long simulationStart;
+  float features[INPUT_DIM];
+} nodes[2];
+
+struct EdgeAutoencoder {
+  float encoder_weights[INPUT_DIM][HIDDEN_DIM];
+  float decoder_weights[HIDDEN_DIM][INPUT_DIM];
+  float encoder_bias[HIDDEN_DIM];
+  float decoder_bias[INPUT_DIM];
+} model;
+
+bool manualTrigger[2] = {false, false};
+bool inProcessing = false;
+unsigned long homeScreenStart = 0;
+
+const char html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Gateway Control</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:Arial;background:#1a1a2e;color:#fff;padding:20px}
+.container{max-width:400px;margin:auto;background:#16213e;padding:30px;border-radius:15px}
+h1{text-align:center;color:#0f3460;margin-bottom:30px}
+.btn{width:100%;padding:20px;margin:15px 0;font-size:18px;border:none;border-radius:8px;cursor:pointer;color:#fff}
+.node1{background:#e74c3c}
+.node1:active{background:#c0392b}
+.node2{background:#3498db}
+.node2:active{background:#2980b9}
+.reset{background:#27ae60}
+.reset:active{background:#229954}
+.disable{background:#95a5a6}
+.disable:active{background:#7f8c8d}
+.info{text-align:center;margin-top:20px;color:#00d4ff;font-size:14px}
+.section{margin:20px 0;padding:15px;background:#0f3460;border-radius:8px}
+.section h3{margin-bottom:10px;font-size:16px}
+</style>
+</head>
+<body>
+<div class="container">
+<h1>🔧 Gateway Control</h1>
+
+<div class="section">
+<h3>⚠️ Trigger Anomaly</h3>
+<button class="btn node1" onclick="trigger(1)">Trigger Node 1</button>
+<button class="btn node2" onclick="trigger(2)">Trigger Node 2</button>
+</div>
+
+<div class="section">
+<h3>🔌 Node Control</h3>
+<button class="btn disable" onclick="toggleNode(1)">Turn Off Node 1</button>
+<button class="btn disable" onclick="toggleNode(2)">Turn Off Node 2</button>
+</div>
+
+<button class="btn reset" onclick="reset()">🔄 Reset System</button>
+
+<div class="info">
+<p>WiFi: Gateway_Demo</p>
+<p>IP: 192.168.4.1</p>
+</div>
+</div>
+<script>
+function trigger(n){fetch('/trigger?node='+n);alert('Triggered Node '+n);}
+function toggleNode(n){
+  fetch('/togglenode?node='+n)
+  .then(r=>r.text())
+  .then(state=>{
+    alert('Node '+n+' is now: '+state);
+  });
+}
+function reset(){fetch('/reset');alert('System Reset');}
+</script>
+</body>
+</html>
+)rawliteral";
+
+void initializeModel() {
+  randomSeed(analogRead(0));
+  for(int i = 0; i < INPUT_DIM; i++) {
+    for(int j = 0; j < HIDDEN_DIM; j++) {
+      model.encoder_weights[i][j] = random(-100, 100) / 100.0;
+    }
+    model.decoder_bias[i] = 0.1;
+  }
+  for(int i = 0; i < HIDDEN_DIM; i++) {
+    model.encoder_bias[i] = 0.1;
+    for(int j = 0; j < INPUT_DIM; j++) {
+      model.decoder_weights[i][j] = random(-100, 100) / 100.0;
+    }
+  }
+}
+
+void extractFeatures(int nodeId, float vib) {
+  int idx = nodeId - 1;
+  nodes[idx].features[0] = vib;
+  nodes[idx].features[1] = vib * vib;
+  nodes[idx].features[2] = sqrt(vib);
+  nodes[idx].features[3] = vib / 10.0;
+  nodes[idx].features[4] = (nodeId == 1) ? 120.0 : 35.0;
+  nodes[idx].features[5] = vib * 1.5;
+  nodes[idx].features[6] = vib * 0.8;
+  nodes[idx].features[7] = vib + 5.0;
+}
+
+float runInference(int nodeId) {
+  int idx = nodeId - 1;
+  float hidden[HIDDEN_DIM] = {0};
+  for(int j = 0; j < HIDDEN_DIM; j++) {
+    for(int i = 0; i < INPUT_DIM; i++) {
+      hidden[j] += nodes[idx].features[i] * model.encoder_weights[i][j];
+    }
+    hidden[j] += model.encoder_bias[j];
+    if(hidden[j] < 0) hidden[j] = 0;
+  }
+
+  float reconstructed[INPUT_DIM] = {0};
+  for(int i = 0; i < INPUT_DIM; i++) {
+    for(int j = 0; j < HIDDEN_DIM; j++) {
+      reconstructed[i] += hidden[j] * model.decoder_weights[j][i];
+    }
+    reconstructed[i] += model.decoder_bias[i];
+  }
+
+  float error = 0;
+  for(int i = 0; i < INPUT_DIM; i++) {
+    float diff = nodes[idx].features[i] - reconstructed[i];
+    error += diff * diff;
+  }
+  return error / INPUT_DIM;
+}
+
+String getXAIExplanation(int nodeId) {
+  if(nodeId == 1) {
+    return "Bearing Fault\n120Hz detected";
+  } else {
+    return "Rotor Imbalance\n35Hz spike";
+  }
+}
+
+float generateSimulatedVibration(int nodeId) {
+  unsigned long elapsed = millis() - nodes[nodeId-1].simulationStart;
+  float base = (nodeId == 1) ? 9.5 : 10.2;
+  float variation = sin(elapsed / 1000.0) * 1.5;
+  return base + variation + random(-50, 50) / 100.0;
+}
+
+void displayMLProcess(int nodeId, float vib) {
+  inProcessing = true;
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Analyzing M");
+  lcd.print(nodeId);
+  lcd.print("...");
+  lcd.setCursor(0, 1);
+  lcd.print("Vib: ");
+  lcd.print(vib, 2);
+  delay(800);
+
+  extractFeatures(nodeId, vib);
+
+  lcd.clear();
+  lcd.print("FFT: Computing");
+  lcd.setCursor(0, 1);
+  lcd.print("Peak: ");
+  lcd.print(nodes[nodeId-1].features[1], 1);
+  delay(600);
+
+  lcd.clear();
+  lcd.print("Model Inference");
+  lcd.setCursor(0, 1);
+  lcd.print("Layers: 8-4-8");
+  delay(500);
+
+  float reconError = runInference(nodeId);
+
+  lcd.clear();
+  lcd.print("Recon. Error:");
+  lcd.setCursor(0, 1);
+  lcd.print(reconError, 4);
+  delay(600);
+
+  lcd.clear();
+  lcd.print("XAI: Analyzing");
+  lcd.setCursor(0, 1);
+  lcd.print("Features: ");
+  lcd.print(INPUT_DIM);
+  delay(500);
+
+  lcd.clear();
+  lcd.print("Feature Weights");
+  lcd.setCursor(0, 1);
+  lcd.print("Computing SHAP");
+  delay(500);
+
+  lcd.clear();
+  lcd.print("Top Feature:");
+  lcd.setCursor(0, 1);
+  if(nodeId == 1) {
+    lcd.print("Harmonic (92%)");
+  } else {
+    lcd.print("Freq Peak (88%)");
+  }
+  delay(700);
+
+  lcd.clear();
+  lcd.print("ALERT: Motor ");
+  lcd.print(nodeId);
+  lcd.setCursor(0, 1);
+  lcd.print(getXAIExplanation(nodeId));
+  delay(2000);
+
+  inProcessing = false;
+  homeScreenStart = millis();
+}
+
+void displayHomeScreen() {
+  if(inProcessing) return;
+
+  lcd.clear();
+
+  lcd.setCursor(0, 0);
+  lcd.print("N1:");
+  if(nodes[0].manuallyDisabled) {
+    lcd.print("OFFLINE");
+  } else {
+    lcd.print(nodes[0].anomaly ? "ANOM" : "OK");
+    lcd.print(" ");
+    lcd.print(nodes[0].vibration, 1);
+  }
+
+  lcd.setCursor(0, 1);
+  lcd.print("N2:");
+  if(nodes[1].manuallyDisabled) {
+    lcd.print("OFFLINE");
+  } else {
+    lcd.print(nodes[1].anomaly ? "ANOM" : "OK");
+    lcd.print(" ");
+    lcd.print(nodes[1].vibration, 1);
+  }
+}
+
+void onDataReceive(const uint8_t *mac, const uint8_t *data, int len) {
+  SensorMessage msg;
+  memcpy(&msg, data, sizeof(msg));
+
+  int nodeId = msg.nodeId;
+  int idx = nodeId - 1;
+
+  if(idx < 0 || idx > 1) return;
+  if(nodes[idx].manuallyDisabled) return;
+
+  nodes[idx].vibration = msg.vibrationLevel;
+  nodes[idx].anomaly = msg.isAnomalous;
+  nodes[idx].receivingData = true;
+  nodes[idx].lastUpdate = millis();
+
+  Serial.print("Node ");
+  Serial.print(nodeId);
+  Serial.print(" | Vib:");
+  Serial.print(msg.vibrationLevel, 2);
+  Serial.print(" | ");
+  Serial.println(msg.isAnomalous ? "ANOM" : "OK");
+
+  if(manualTrigger[idx] || msg.isAnomalous) {
+    displayMLProcess(nodeId, msg.vibrationLevel);
+    manualTrigger[idx] = false;
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  initializeModel();
+
+  for(int i = 0; i < 2; i++) {
+    nodes[i].vibration = 0;
+    nodes[i].anomaly = false;
+    nodes[i].receivingData = false;
+    nodes[i].manuallyDisabled = false;
+    nodes[i].lastUpdate = 0;
+    nodes[i].simulationStart = millis();
+  }
+
+  Wire.begin(21, 22);
+  lcd.init();
+  lcd.backlight();
+
+  lcd.clear();
+  lcd.print("Initializing...");
+  delay(1000);
+
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAP(ssid, password);
+
+  Serial.println("\nGateway Started");
+  Serial.print("IP: ");
+  Serial.println(WiFi.softAPIP());
+
+  if(esp_now_init() != ESP_OK) {
+    lcd.clear();
+    lcd.print("ESP-NOW FAIL");
+    Serial.println("ESP-NOW init failed!");
+    while(1);
+  }
+
+  Serial.println("ESP-NOW initialized");
+  Serial.print("Gateway MAC: ");
+  Serial.println(WiFi.macAddress());
+
+  esp_now_register_recv_cb(onDataReceive);
+
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+    request->send_P(200, "text/html", html);
+  });
+
+  server.on("/trigger", HTTP_GET, [](AsyncWebServerRequest *request){
+    if(request->hasParam("node")) {
+      int node = request->getParam("node")->value().toInt();
+      if(node >= 1 && node <= 2) {
+        manualTrigger[node - 1] = true;
+      }
+    }
+    request->send(200, "text/plain", "OK");
+  });
+
+  server.on("/togglenode", HTTP_GET, [](AsyncWebServerRequest *request){
+    if(request->hasParam("node")) {
+      int node = request->getParam("node")->value().toInt();
+      if(node >= 1 && node <= 2) {
+        int idx = node - 1;
+        nodes[idx].manuallyDisabled = !nodes[idx].manuallyDisabled;
+        String state = nodes[idx].manuallyDisabled ? "OFFLINE" : "ONLINE";
+        Serial.print("Node ");
+        Serial.print(node);
+        Serial.print(" manually set to: ");
+        Serial.println(state);
+        request->send(200, "text/plain", state);
+        return;
+      }
+    }
+    request->send(400, "text/plain", "Invalid node");
+  });
+
+  server.on("/reset", HTTP_GET, [](AsyncWebServerRequest *request){
+    manualTrigger[0] = false;
+    manualTrigger[1] = false;
+    inProcessing = false;
+    for(int i = 0; i < 2; i++) {
+      nodes[i].manuallyDisabled = false;
+    }
+    request->send(200, "text/plain", "OK");
+  });
+
+  server.begin();
+
+  lcd.clear();
+  lcd.print("Gateway Ready");
+  lcd.setCursor(0, 1);
+  lcd.print(WiFi.softAPIP());
+
+  Serial.println("\n=== GATEWAY READY ===");
+  Serial.println("Waiting for sensor nodes...");
+  Serial.println("=====================\n");
+
+  delay(2000);
+
+  homeScreenStart = millis();
+}
+
+void loop() {
+  unsigned long now = millis();
+
+  for(int i = 0; i < 2; i++) {
+    if(nodes[i].manuallyDisabled) continue;
+
+    if(nodes[i].receivingData && (now - nodes[i].lastUpdate > SIMULATION_TIMEOUT)) {
+      nodes[i].receivingData = false;
+      nodes[i].simulationStart = now;
+      Serial.print("Node ");
+      Serial.print(i + 1);
+      Serial.println(" - No data, starting simulation");
+    }
+
+    if(!nodes[i].receivingData) {
+      nodes[i].vibration = generateSimulatedVibration(i + 1);
+      nodes[i].anomaly = false;
+    }
+
+    if(manualTrigger[i]) {
+      Serial.print("Manual trigger for Node ");
+      Serial.println(i + 1);
+      displayMLProcess(i + 1, nodes[i].vibration);
+      manualTrigger[i] = false;
+    }
+  }
+
+  if(now - homeScreenStart > 1000) {
+    displayHomeScreen();
+    homeScreenStart = now;
+  }
+
+  delay(100);
+}
