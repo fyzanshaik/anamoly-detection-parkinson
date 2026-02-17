@@ -1,0 +1,35 @@
+{
+  "config_name": "statistical",
+  "feature_group": "statistical",
+  "feature_names": [
+    "mean",
+    "peak",
+    "rms",
+    "std",
+    "skewness",
+    "kurtosis",
+    "crest_factor",
+    "shape_factor",
+    "impulse_factor",
+    "clearance_factor"
+  ],
+  "input_dim": 10,
+  "hidden_dims": [
+    6,
+    3
+  ],
+  "best_epoch": 150,
+  "best_val_loss": 0.2021465301513672,
+  "threshold": 0.6043691647069972,
+  "detection_rate": 99.92914501653283,
+  "false_positive_rate": 5.13595166163142,
+  "n_train": 1321,
+  "n_val": 331,
+  "n_anomaly": 4234,
+  "train_mse_mean": 0.19833166351290465,
+  "train_mse_std": 0.19224720041094112,
+  "val_mse_mean": 0.20214652341124337,
+  "val_mse_std": 0.2182150390024084,
+  "anomaly_mse_mean": 689.1724801046495,
+  "anomaly_mse_std": 1013.3630824415466
+}

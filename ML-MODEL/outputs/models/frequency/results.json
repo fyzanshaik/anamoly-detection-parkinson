@@ -1,0 +1,34 @@
+{
+  "config_name": "frequency",
+  "feature_group": "frequency",
+  "feature_names": [
+    "dominant_freq",
+    "mean_freq",
+    "median_freq",
+    "spectral_entropy",
+    "total_energy",
+    "band_0_500",
+    "band_500_1500",
+    "band_1500_3000",
+    "band_3000_6000"
+  ],
+  "input_dim": 9,
+  "hidden_dims": [
+    6,
+    3
+  ],
+  "best_epoch": 150,
+  "best_val_loss": 0.08416413515806198,
+  "threshold": 0.20324214889918588,
+  "detection_rate": 100.0,
+  "false_positive_rate": 5.13595166163142,
+  "n_train": 1321,
+  "n_val": 331,
+  "n_anomaly": 4234,
+  "train_mse_mean": 0.07810792821051758,
+  "train_mse_std": 0.07872959295922013,
+  "val_mse_mean": 0.08416413079017364,
+  "val_mse_std": 0.10859979329240114,
+  "anomaly_mse_mean": 240468.66276918488,
+  "anomaly_mse_std": 113124.09198553885
+}

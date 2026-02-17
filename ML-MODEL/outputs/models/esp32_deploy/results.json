@@ -1,0 +1,43 @@
+{
+  "config_name": "esp32_deploy",
+  "feature_group": "stat_freq",
+  "feature_names": [
+    "mean",
+    "peak",
+    "rms",
+    "std",
+    "skewness",
+    "kurtosis",
+    "crest_factor",
+    "shape_factor",
+    "impulse_factor",
+    "clearance_factor",
+    "dominant_freq",
+    "mean_freq",
+    "median_freq",
+    "spectral_entropy",
+    "total_energy",
+    "band_0_500",
+    "band_500_1500",
+    "band_1500_3000",
+    "band_3000_6000"
+  ],
+  "input_dim": 19,
+  "hidden_dims": [
+    8
+  ],
+  "best_epoch": 150,
+  "best_val_loss": 0.0306209959089756,
+  "threshold": 0.08116906969161009,
+  "detection_rate": 100.0,
+  "false_positive_rate": 5.13595166163142,
+  "n_train": 1321,
+  "n_val": 331,
+  "n_anomaly": 4234,
+  "train_mse_mean": 0.02897031527419925,
+  "train_mse_std": 0.02413624864034419,
+  "val_mse_mean": 0.03062099255428601,
+  "val_mse_std": 0.025587597321691684,
+  "anomaly_mse_mean": 147124.24712047813,
+  "anomaly_mse_std": 63500.362333408564
+}

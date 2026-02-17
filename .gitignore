@@ -12,8 +12,19 @@ __pycache__/
 .Python
 env/
 venv/
+.venv/
 .env
 .ipynb_checkpoints/
+
+# CWRU raw data (large .mat files, re-downloadable)
+ML-MODEL/data/cwru/raw/
+ML-MODEL/data/cwru/*.npz
+ML-MODEL/data/cwru/*.npy
+ML-MODEL/data/processed/
+
+# Trained model binaries (re-trainable)
+ML-MODEL/outputs/models/**/autoencoder.keras
+ML-MODEL/outputs/models/**/*.npy
 
 # OS Specific
 .DS_Store

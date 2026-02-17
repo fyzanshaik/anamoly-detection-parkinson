@@ -1,0 +1,20 @@
+{
+  "statistical": {
+    "auc_roc": 0.999749545828832
+  },
+  "frequency": {
+    "auc_roc": 0.9999999999999999
+  },
+  "mfcc": {
+    "auc_roc": 1.0
+  },
+  "stat_freq": {
+    "auc_roc": 0.9999999999999999
+  },
+  "fused": {
+    "auc_roc": 1.0
+  },
+  "esp32_deploy": {
+    "auc_roc": 1.0
+  }
+}
