@@ -1,7 +1,18 @@
 {
   "permissions": {
     "allow": [
-      "Bash(pio run:*)"
+      "Bash(pio run:*)",
+      "Bash(find /home/fyzanshaik/workspace/github.com/fyzanshaik/anamoly-detection -type f -name README* -o -name *.md -o -name requirements*.txt -o -name setup.py -o -name pyproject.toml)",
+      "Bash(find /home/fyzanshaik/workspace/github.com/fyzanshaik/anamoly-detection/ML-MODEL -type f -not -path */.pio/*)",
+      "Bash(find /home/fyzanshaik/workspace/github.com/fyzanshaik/anamoly-detection -maxdepth 2 -not -path */.git/* -not -path */.pio/* -not -path */.vscode/* -not -path */.claude/* -type d)",
+      "Bash(du -sh /home/fyzanshaik/workspace/github.com/fyzanshaik/anamoly-detection/*)",
+      "Bash(python:*)",
+      "Bash(pip install:*)",
+      "Bash(python3 -c \":*)",
+      "Bash(python3 ML-MODEL/src/collect_and_train.py --check)",
+      "Bash(python3:*)",
+      "Bash(cd:*)",
+      "Bash(git add:*)"
     ],
     "deny": [],
     "ask": []
